@@ -1,55 +1,243 @@
-#pragma once
-#include "stdafx.h"
-#define MAX_THREAD 8
-namespace fs = std::filesystem;
+#include "finder_engine.h"
 
-class thread_pool
+finder_engine::finder_engine() : available_thread(get_num_thread()){};
+
+finder_engine::~finder_engine()
+= default;
+
+thread_pool::thread_pool(const int threads) : shutdown_(false)
 {
-public:
+    for (int i = 0; i < threads; ++i)
+        threads_.emplace_back(std::bind(&thread_pool::threadEntry, this, i));
+}
 
-	explicit thread_pool(int threads);
-    thread_pool();
-    ~thread_pool();
+thread_pool::thread_pool()
+= default;
 
-    void execute(std::function <void()> func);
+thread_pool::~thread_pool()
+{
 
-protected:
+    {
 
-    void threadEntry(int i);
-    std::mutex lock_; 
-    std::condition_variable condVar_;
-    bool shutdown_ = false;
+        std::unique_lock <std::mutex> l(lock_);
+        shutdown_ = true;
 
-    std::queue <std::function <void()>> jobs_;
+    }
 
-    std::vector <std::thread> threads_;
+    condVar_.notify_all();
 
+    for (auto& thread : threads_)
+        thread.join();
+
+    threads_.clear();
+
+}
+
+void thread_pool::execute(std::function<void()> func)
+{
+    std::unique_lock <std::mutex> l(lock_);
+    jobs_.emplace(std::move(func));
+    condVar_.notify_one();
+}
+
+void thread_pool::threadEntry(int i)
+{
+    std::function <void()> job;
+
+    while (true)
+    {
+        {
+            std::unique_lock <std::mutex> l(lock_);
+
+            while (!shutdown_ && jobs_.empty())
+                condVar_.wait(l);
+
+            if (jobs_.empty())
+            {
+
+                return;
+            }
+
+            job = std::move(jobs_.front());
+            jobs_.pop();
+        }
+
+        job();
+    }
 
 };
 
-class finder_engine: public thread_pool
+ std::vector<std::string> finder_engine::getListOfDrives()
 {
-public:
-    finder_engine();
-    ~finder_engine();
+    std::vector<std::string> arrayOfDrives;
+    char* szDrives = new char[MAX_PATH]();
 
-     std::vector<std::string>
-        getListSubDir(std::string const& dir, std::string const& app_name);
+    if (GetLogicalDriveStringsA(MAX_PATH, szDrives))
+        for (int i = 0; i < 100; i += 4)
+            if (szDrives[i] != static_cast<char>(0))
+                arrayOfDrives.push_back(std::string{ szDrives[i],szDrives[i + 1],szDrives[i + 2] });
+    delete[] szDrives;
+    return arrayOfDrives;
+}
 
-    static inline std::vector<std::string> getListOfDrives();
+void finder_engine::Finder(std::string const& dir, std::string const& name, std::string& result)
+{
+    if (!exit_thread_flag)
+    {
+        std::vector<fs::path> pathes{ fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied), {} }; //,  
 
-    inline int get_num_thread();
 
-    std::string get_path_by_name(std::string const& app_name);
+        for (auto& p : pathes)
+        {
+            if (!exit_thread_flag)
+            {
+                std::cout << "ID -> " << std::this_thread::get_id() << "    | ";
+                _cputws(p.wstring().c_str());
+                _cputws(L"\n");
 
-    
+                if (p.has_extension() && (p.filename() == name))
 
-private:
-    std::string path = "NoFound";
-    int available_thread = 0;
-    void Finder(std::string const& dir, std::string const& name, std::string& result);
-    std::atomic<bool> exit_thread_flag{ false };
+                {
+
+                    exit_thread_flag = true;
+                    result = p.string();
+
+                }
+
+            }
+
+        }
+    }
+}
+
+std::vector<std::string>
+finder_engine::getListSubDir(std::string const& dir, std::string const& app_name)
+{
+
+    std::vector<std::string> base;
+
+    std::vector<fs::path>
+        pathes{ fs::directory_iterator(dir, fs::directory_options::none), {} };
+
+    for (auto& p : pathes)
+    {
+        //const fs::file_status s = symlink_status(p);
+        if (p.has_extension() && ((p.filename().string() == app_name)))
+        {
+            base.clear();
+            base.push_back(p.filename().string());
+            base.push_back(p.string());
+            return base;
+        }
+        else if (!p.has_extension() && p.string() != "C:\\Windows")
+            base.push_back(p.string());
+
+    }
+    return base;
+}
+
+int finder_engine::get_num_thread()
+{
+    if (const auto thread_count = std::thread::hardware_concurrency(); thread_count > MAX_THREAD)
+        available_thread = MAX_THREAD;
+    else available_thread = thread_count;
+    return  available_thread;
+} 
+
+std::string finder_engine::get_path_by_name(std::string const& app_name)
+{
+    const std::vector<std::string> lg_d = getListOfDrives();
+     std::vector<std::string> list_root;
+
+    for (int i = 0; i < lg_d.size(); i++)
+    {
+        std::vector<std::string> buf = getListSubDir(lg_d[i], app_name);
+        std::vector<std::string>::const_iterator it = buf.begin();
+        while (it != buf.end())
+        {
+            list_root.push_back(*it);
+            if (app_name == list_root[0]) return *(++it);
+            ++it;
+        }
+    }
+
+    {
+       
+        thread_pool pool(available_thread);
+        int i = 0;
+
+        while (i < list_root.size())
+        {
+            pool.execute([list_root, app_name, i, this]()
+                {
+                    Finder(list_root[i], app_name, std::ref(path));
+                });
+            i++;
+        }
+    } 
    
-    
-};
+
+   /* while (i < list_root.size())
+    {
+
+        p.execute(std::bind([&path, app_name, list_root, i, this]()
+            {
+                if (!exit_thread_flag)
+                {
+	                const std::vector<fs::path> pathes{ fs::recursive_directory_iterator(list_root[i], fs::directory_options::skip_permission_denied), {}}; //,  
+
+
+                    for (auto& p : pathes)
+                    {
+                        if (!exit_thread_flag)
+                        {
+                            #ifdef DEBUG
+                            std::cout << "ID -> " << std::this_thread::get_id() << "    | ";
+                            _cputws(p.wstring().c_str());
+                            _cputws(L"\n");
+                             #endif
+
+                            if (p.has_extension() && (p.filename() == app_name))
+
+                            {
+
+                                exit_thread_flag = true;
+                                path = p.string();
+
+                            }
+
+                        }
+
+                    }
+                }
+
+            }));
+
+        i++;
+    }
+
+    p.~thread_pool();
+    */
+
+
+    //TODO if need check firstly root disk, and after another
+
+    /*if(path == "NoFound")
+    {
+        j++;
+        if(j > lg_d.size())
+        {
+            return path;
+        }
+        std::cout << "App Not Found on drive: " << lg_d[j-1] << "\n Trying drive: " << lg_d[j] << std::endl;
+        std::cin.get();
+        std::cin.get();
+        std::cout << "Enter to search on other Drive" << std::endl;
+        return  get_path_by_name(app_name);
+    }*/
+
+    return path;
+}
+
+
 
